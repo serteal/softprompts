@@ -1,14 +1,14 @@
 import logging
 from dataclasses import dataclass
-from typing import Union
 
 import torch
 import transformers
-from jaxtyping import Float, Int
+from jaxtyping import Int
 from torch import Tensor
+from tqdm.auto import tqdm
 from transformers import set_seed
 
-logger = logging.getLogger("nanosoftprompt")
+logger = logging.getLogger("softprompts")
 if not logger.hasHandlers():
     handler = logging.StreamHandler()
     formatter = logging.Formatter(
@@ -23,16 +23,12 @@ if not logger.hasHandlers():
 @dataclass
 class SoftPromptConfig:
     num_steps: int = 100
+    num_epochs: int = 1
+    batch_size: int = 4
     optim_str_init: str = "x x x x x x x x x x x x x x x x x x x x"
     lr: float = 0.0001
     seed: int | None = None
-    verbosity: str = "INFO"
-
-
-@dataclass
-class SoftPromptResult:
-    losses: list[float]
-    optim_embeds: Tensor
+    verbose: bool = True
 
 
 class SoftPrompt:
@@ -48,6 +44,7 @@ class SoftPrompt:
         for param in model.parameters():
             param.requires_grad = False
         self.tokenizer = tokenizer
+        self.embedding_layer = self.model.get_input_embeddings()
         self.config = config
         self.device = model.device
 
@@ -58,64 +55,81 @@ class SoftPrompt:
         self.optim_str_token_id = self.tokenizer.convert_tokens_to_ids(
             self.optim_str_token
         )
+        self.optim_embeds = None
+
+        # Ensure the tokenizer has a pad token
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token:
+            pass
+        elif tokenizer.unk_token:
+            tokenizer.pad_token_id = tokenizer.unk_token_id
+        elif tokenizer.eos_token:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        else:
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
 
         if self.config.seed is not None:
             set_seed(self.config.seed)
             torch.use_deterministic_algorithms(True, warn_only=True)
 
-    def normalize_messages(
-        self, messages: str | list[str] | list[dict] | list[list[dict]]
-    ) -> list[list[dict]]:
-        if isinstance(messages, str):
-            return [[{"role": "user", "content": messages}]]
-        elif isinstance(messages, list) and isinstance(messages[0], str):
-            return [[{"role": "user", "content": m}] for m in messages]
-        elif isinstance(messages, list) and isinstance(messages[0], dict):
-            return [messages]
-        elif (
-            isinstance(messages, list)
-            and isinstance(messages[0], list)
-            and isinstance(messages[0][0], dict)
-        ):
-            return messages
-        else:
-            raise ValueError(
-                f"Invalid messages type: {type(messages)}. "
-                "Expected str, list[str], list[dict], or list[list[dict]]"
+    def add_optim_str_token(self, messages: list[str]) -> list[str]:
+        """Adds the <|optim_str|> token to each message."""
+        return [x + self.optim_str_token for x in messages]
+
+    def tokenize(
+        self,
+        text: str | list[str],
+        add_chat_template: bool = False,
+        **tokenizer_kwargs,
+    ) -> tuple[Int[Tensor, "batch seq_len"], Int[Tensor, "batch seq_len"]]:
+        if isinstance(text, str):
+            text = [text]
+
+        if add_chat_template:
+            # Assume that text argument is the user input
+            batched_messages = [[{"role": "user", "content": msg}] for msg in text]
+            text = self.tokenizer.apply_chat_template(
+                batched_messages,
+                tokenize=False,
+                add_generation_prompt=True,  # type: ignore
             )
+            if self.tokenizer.bos_token:
+                # Remove the BOS token -- this will get added when tokenizing, if necessary
+                text = [
+                    text.replace(self.tokenizer.bos_token, "")
+                    for text in text
+                    if text.startswith(self.tokenizer.bos_token)
+                ]
 
-    def add_optim_token(self, dialog_list: list[list[dict]]) -> list[list[dict]]:
-        for dialog in dialog_list:
-            if not any([self.optim_str_token in d["content"] for d in dialog]):
-                dialog[-1]["content"] = dialog[-1]["content"] + self.optim_str_token
-        return dialog_list
-
-    def tokenize_and_split_messages(
-        self, messages: list[list[dict]]
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        # adds optim_str_token to the last message in each dialog, noop if already present
-        messages = self.add_optim_token(messages)
-        templates = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False
-        )
-        logger.debug(templates)
-
-        full_tokenized_templates = self.tokenizer(
-            templates,
+        inputs = self.tokenizer(
+            text=text,
             return_tensors="pt",
-            padding="longest",
-            padding_side="left",
+            **tokenizer_kwargs,
         )
-        full_input_ids = full_tokenized_templates["input_ids"]
-        full_attn_mask = full_tokenized_templates["attention_mask"]
-        # ^-- [batch_size, seq_len]
 
-        # check the optim str token is in the same position for all templates
-        optim_str_positions = (full_input_ids == self.optim_str_token_id).nonzero(
+        return inputs["input_ids"].to(self.device), inputs["attention_mask"].to(
+            self.device
+        )
+
+    def split_tokenized_messages_on_optim_str(
+        self,
+        input_ids: Int[Tensor, "batch seq_len"],
+        attn_mask: Int[Tensor, "batch seq_len"] | None = None,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Splits the tokenized messages on the <|optim_str|> token.
+        Returns the left and right input ids and attention masks without the optim str token.
+        If the attention mask is not provided, it is not returned.
+
+        Args:
+            input_ids: The tokenized messages.
+            attn_mask: The attention mask. Optional, only returned if provided.
+        """
+        optim_str_positions = (input_ids == self.optim_str_token_id).nonzero(
             as_tuple=False
         )
         unique_columns = torch.unique(optim_str_positions[:, 1])
-        counts = torch.sum(full_input_ids == self.optim_str_token_id, dim=1)
+        counts = torch.sum(input_ids == self.optim_str_token_id, dim=1)
         assert torch.all(counts == 1), (
             "Not exactly one instance of self.optim_str_token_id in each row."
         )
@@ -124,120 +138,199 @@ class SoftPrompt:
         )
 
         insertion_column = unique_columns.item()
-        left_input_ids = full_input_ids[:, :insertion_column]
-        right_input_ids = full_input_ids[:, insertion_column + 1 :]
-        left_attn_mask = full_attn_mask[:, :insertion_column]
-        right_attn_mask = full_attn_mask[:, insertion_column + 1 :]
+        left_input_ids = input_ids[:, :insertion_column]
+        right_input_ids = input_ids[:, insertion_column + 1 :]
+        if attn_mask is not None:
+            left_attn_mask = attn_mask[:, :insertion_column]
+            right_attn_mask = attn_mask[:, insertion_column + 1 :]
+            return left_input_ids, right_input_ids, left_attn_mask, right_attn_mask
 
-        return left_input_ids, right_input_ids, left_attn_mask, right_attn_mask
+        return left_input_ids, right_input_ids
+
+    def generate_with_softprompt(
+        self,
+        messages: str | list[str],
+        optim_embeds: Tensor,
+        **generation_kwargs,
+    ) -> str | list[str]:
+        if isinstance(messages, str):
+            messages = [messages]
+
+        optim_embeds = optim_embeds.to(self.device)
+
+        messages = self.add_optim_str_token(messages)
+        input_ids, attn_mask = self.tokenize(
+            messages,
+            add_chat_template=True,
+            padding="longest",
+            padding_side="left",
+        )
+        left_input_ids, right_input_ids, left_attn_mask, right_attn_mask = (
+            self.split_tokenized_messages_on_optim_str(input_ids, attn_mask)
+        )
+
+        before_embeds, after_embeds = [
+            self.embedding_layer(ids) for ids in (left_input_ids, right_input_ids)
+        ]
+
+        batched_optim_embeds = optim_embeds.expand(len(messages), -1, -1)
+        batched_attn_mask = torch.ones(
+            len(messages), optim_embeds.shape[1], device=self.device
+        )
+
+        input_embeds = torch.cat(
+            [
+                before_embeds.detach(),
+                batched_optim_embeds,
+                after_embeds.detach(),
+            ],
+            dim=1,
+        )
+        input_attn_mask = torch.cat(
+            [
+                left_attn_mask.detach(),
+                batched_attn_mask,
+                right_attn_mask.detach(),
+            ],
+            dim=1,
+        )
+
+        generation = self.model.generate(
+            inputs_embeds=input_embeds,
+            attention_mask=input_attn_mask,
+            **generation_kwargs,
+        )
+
+        return self.tokenizer.batch_decode(generation, skip_special_tokens=True)
 
     def run(
         self,
-        messages: str | list[str] | list[dict] | list[list[dict]],
+        messages: str | list[str],
         target: str | list[str],
-    ) -> SoftPromptResult:
-        messages = self.normalize_messages(messages)
-        left_input_ids, right_input_ids, left_attn_mask, right_attn_mask = (
-            self.tokenize_and_split_messages(messages)
-        )
-
+    ) -> "SoftPrompt":
+        if isinstance(messages, str):
+            messages = [messages]
         if isinstance(target, str):
             target = [target]
-        tokenized_target = self.tokenizer(
-            target,
-            return_tensors="pt",
-            add_special_tokens=False,
-            padding="longest",
-            padding_side="right",
+
+        message_dataloader = torch.utils.data.DataLoader(
+            messages, batch_size=self.config.batch_size, shuffle=False
         )
-        target_ids = tokenized_target["input_ids"]
-        target_attn_mask = tokenized_target["attention_mask"]
+        target_dataloader = torch.utils.data.DataLoader(
+            target, batch_size=self.config.batch_size, shuffle=False
+        )
 
-        # Embed everything that doesn't get optimized
-        embedding_layer = self.model.get_input_embeddings()
-        before_embeds, after_embeds, target_embeds = [
-            embedding_layer(ids)
-            for ids in (left_input_ids, right_input_ids, target_ids)
-        ]
-
-        # # Compute the KV Cache for tokens that appear before the optimized tokens
-        # with torch.no_grad():
-        #     output = self.model(inputs_embeds=before_embeds, use_cache=True)
-        #     prefix_cache = output.past_key_values
-
-        optim_ids = self.tokenizer(
-            self.config.optim_str_init,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )["input_ids"].to(self.device)
-        optim_embeds = embedding_layer(optim_ids).detach().clone().requires_grad_()
+        optim_ids, _ = self.tokenize(
+            self.config.optim_str_init, add_special_tokens=False
+        )
+        optim_embeds = self.embedding_layer(optim_ids).detach().clone().requires_grad_()
 
         optimizer = torch.optim.Adam([optim_embeds], lr=self.config.lr, eps=1e-6)
 
-        losses = []
-        for i in range(self.config.num_steps):
-            optimizer.zero_grad()
-            batched_optim_embeds = optim_embeds.expand(left_input_ids.shape[0], -1, -1)
-            batched_attn_mask = torch.ones(left_input_ids.shape[0], optim_ids.shape[1])
-            input_embeds = torch.cat(
-                [
-                    before_embeds.detach(),
-                    batched_optim_embeds,
-                    after_embeds.detach(),
-                    target_embeds.detach(),
-                ],
-                dim=1,
-            )
-            input_attn_mask = torch.cat(
-                [
-                    left_attn_mask.detach(),
-                    batched_attn_mask,
-                    right_attn_mask.detach(),
-                    target_attn_mask.detach(),
-                ],
-                dim=1,
-            )
+        epoch_losses = []
+        for epoch in range(self.config.num_epochs):
+            batch_losses = []
+            for messages, target in tqdm(
+                zip(message_dataloader, target_dataloader),
+                total=len(message_dataloader),
+                desc=f"Epoch {epoch + 1}/{self.config.num_epochs}",
+                disable=not self.config.verbose,
+            ):
+                # Tokenizes and splits messages on <|optim_str|> token
+                messages = self.add_optim_str_token(messages)
+                input_ids, attn_mask = self.tokenize(
+                    messages,
+                    add_chat_template=True,
+                    padding="longest",
+                    padding_side="left",
+                )
+                left_input_ids, right_input_ids, left_attn_mask, right_attn_mask = (
+                    self.split_tokenized_messages_on_optim_str(input_ids, attn_mask)
+                )
 
-            output = self.model(
-                inputs_embeds=input_embeds,
-                attention_mask=input_attn_mask,
-                output_hidden_states=True,
-            )
-            logits = output.logits
+                # Tokenizes target
+                target_ids, target_attn_mask = self.tokenize(
+                    target,
+                    padding="longest",
+                    padding_side="right",
+                    add_special_tokens=False,
+                )
 
-            # Shift logits so token n-1 predicts token n
-            shift = input_embeds.shape[1] - target_ids.shape[1]
-            shift_logits = logits[
-                ..., shift - 1 : -1, :
-            ].contiguous()  # [batch_size, num_target_ids, vocab_size]
-            shift_labels = target_ids
+                # Embeds everything that doesn't get optimized
+                before_embeds, after_embeds, target_embeds = [
+                    self.embedding_layer(ids)
+                    for ids in (left_input_ids, right_input_ids, target_ids)
+                ]
 
-            loss = torch.nn.functional.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
-            loss_float = loss.item()
-            losses.append(loss_float)
+                batch_size = input_ids.shape[0]
+                losses = []
+                for i in range(self.config.num_steps):
+                    optimizer.zero_grad()
 
-            logger.debug(f"Iter: {i:3d} | Loss: {loss_float}")
+                    batched_optim_embeds = optim_embeds.expand(batch_size, -1, -1)
+                    batched_attn_mask = torch.ones(
+                        batch_size, optim_embeds.shape[1], device=self.device
+                    )
 
-            loss.backward()
-            optimizer.step()
+                    input_embeds = torch.cat(
+                        [
+                            before_embeds.detach(),
+                            batched_optim_embeds,
+                            after_embeds.detach(),
+                            target_embeds.detach(),
+                        ],
+                        dim=1,
+                    )
+                    input_attn_mask = torch.cat(
+                        [
+                            left_attn_mask.detach(),
+                            batched_attn_mask,
+                            right_attn_mask.detach(),
+                            target_attn_mask.detach(),
+                        ],
+                        dim=1,
+                    )
 
-        result = SoftPromptResult(
-            losses=losses,
-            optim_embeds=optim_embeds.cpu(),
-        )
+                    output = self.model(
+                        inputs_embeds=input_embeds,
+                        attention_mask=input_attn_mask,
+                        output_hidden_states=True,
+                    )
+                    logits = output.logits
 
-        return result
+                    # Shift logits so token n-1 predicts token n
+                    shift = input_embeds.shape[1] - target_ids.shape[1]
+                    shift_logits = logits[
+                        ..., shift - 1 : -1, :
+                    ].contiguous()  # [batch_size, num_target_ids, vocab_size]
+                    shift_labels = target_ids
+
+                    loss = torch.nn.functional.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                    )
+                    loss_float = loss.item()
+                    losses.append(loss_float)
+
+                    # logger.info(f"Iter: {i:3d} | Loss: {loss_float}")
+
+                    loss.backward()
+                    optimizer.step()
+
+                batch_losses.append(losses)
+            epoch_losses.append(batch_losses)
+
+        self.optim_embeds = optim_embeds.detach().cpu()
+        return self
 
 
 def run(
     model: transformers.PreTrainedModel,
     tokenizer: transformers.PreTrainedTokenizer,
-    messages: Union[str, list[dict]],
-    target: str,
+    messages: str | list[str],
+    target: str | list[str],
     config: SoftPromptConfig | None = None,
-) -> SoftPromptResult:
+) -> SoftPrompt:
     """Generates a single optimized string using soft-prompt optimization.
 
     Args:
@@ -248,12 +341,12 @@ def run(
         config: The configuration to use.
 
     Returns:
-        A SoftPromptResult object that contains losses and the optimized strings.
+        A SoftPrompt object that contains the optimized strings.
     """
     if config is None:
         config = SoftPromptConfig()
 
-    logger.setLevel(getattr(logging, config.verbosity))
+    logger.setLevel(logging.INFO if config.verbose else logging.WARNING)
 
     softprompt = SoftPrompt(model, tokenizer, config)
     return softprompt.run(messages, target)

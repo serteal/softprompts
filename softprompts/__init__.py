@@ -1,3 +1,7 @@
-from .softprompt import SoftPrompt, SoftPromptConfig, SoftPromptResult, run
+from .softprompt import SoftPrompt, SoftPromptConfig, run
 
-__all__ = ["run", "SoftPrompt", "SoftPromptConfig", "SoftPromptResult"]
+__all__ = [
+    "run",
+    "SoftPrompt",
+    "SoftPromptConfig",
+]
