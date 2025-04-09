@@ -51,7 +51,6 @@ def main():
         num_steps=30,
         batch_size=1,
     )
-
     softprompt = sp.run(
         model,
         tokenizer,

@@ -47,6 +47,8 @@ class SoftPrompt:
         self.embedding_layer = self.model.get_input_embeddings()
         self.config = config
         self.device = model.device
+        if self.device == torch.device("cpu"):
+            logger.warning("Running on CPU -- this will be slow!")
 
         # add token <|optim_str|> for {optim_str} that will not be embedded
         self.tokenizer.add_special_tokens(
@@ -195,6 +197,7 @@ class SoftPrompt:
             dim=1,
         )
 
+        logger.info(f"Generating model response with {input_embeds.shape[1]} tokens")
         generation = self.model.generate(
             inputs_embeds=input_embeds,
             attention_mask=input_attn_mask,
@@ -310,8 +313,6 @@ class SoftPrompt:
                     )
                     loss_float = loss.item()
                     losses.append(loss_float)
-
-                    # logger.info(f"Iter: {i:3d} | Loss: {loss_float}")
 
                     loss.backward()
                     optimizer.step()
