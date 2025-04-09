@@ -300,9 +300,8 @@ class SoftPrompt:
 
                     # Shift logits so token n-1 predicts token n
                     shift = input_embeds.shape[1] - target_ids.shape[1]
-                    shift_logits = logits[
-                        ..., shift - 1 : -1, :
-                    ].contiguous()  # [batch_size, num_target_ids, vocab_size]
+                    shift_logits = logits[..., shift - 1 : -1, :].contiguous()
+                    # ^-- [batch_size, num_target_ids, vocab_size]
                     shift_labels = target_ids
 
                     loss = torch.nn.functional.cross_entropy(

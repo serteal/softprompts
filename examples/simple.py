@@ -1,5 +1,5 @@
 """
-Simple script that runs soft-prompt optimization with the default settings
+Simple script that runs soft-prompt optimization with some custom settings
 """
 
 import argparse
@@ -7,7 +7,7 @@ import argparse
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import softprompts
+import softprompts as sp
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,14 +45,14 @@ def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    config = softprompts.SoftPromptConfig(
+    config = sp.SoftPromptConfig(
         verbose=args.verbose,
         num_epochs=2,
         num_steps=30,
         batch_size=1,
     )
 
-    softprompt = softprompts.run(
+    softprompt = sp.run(
         model,
         tokenizer,
         args.prompt,
