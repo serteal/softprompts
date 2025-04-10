@@ -45,7 +45,7 @@ def main():
         num_steps=30,
         batch_size=1,
     )
-    softprompt = sp.train_softprompt(
+    softprompt, _ = sp.train_softprompt(
         model,
         tokenizer,
         args.prompt,

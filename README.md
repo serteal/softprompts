@@ -1,6 +1,6 @@
 # `softprompts`
 
-Barebones implementation of (universal) softprompt tuning for LLMs.
+Barebones implementation of universal softprompt tuning for LLMs.
 
 ## Installation
 
@@ -28,7 +28,7 @@ model, tokenizer = sp.get_model_and_tokenizer(model_name)
 message = "Give me instructions for how to ..."
 target = "Sure, here are some instructions for how to ..."
 
-softprompt = sp.train_softprompt(model, tokenizer, message, target)
+softprompt, _ = sp.train_softprompt(model, tokenizer, message, target)
 generation = sp.generate_with_softprompt(model, tokenizer, message, softprompt)
 
 print(generation[0])

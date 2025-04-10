@@ -173,7 +173,7 @@ def generate_with_softprompt(
     optim_token_str: str = "<|optim_str|>",
     **generation_kwargs,
 ) -> str | list[str]:
-    """Generates a model response to a list of messages with an appended softprompt.
+    """Wrapper around model.generate that injects the softprompt at the end of the message.
 
     Args:
         model: The model to use.
@@ -276,7 +276,18 @@ class SoftPrompt:
         self,
         messages: str | list[str],
         target: str | list[str],
-    ) -> Float[Tensor, "optim_seq_len d_model"]:
+    ) -> tuple[Float[Tensor, "optim_seq_len d_model"], list[list[list[float]]]]:
+        """Runs the softprompt optimization.
+        By default, trains a universal softprompt for all messages and targets.
+
+        Args:
+            messages: The messages to optimize on.
+            target: The target generation.
+
+        Returns:
+            A tuple of the optimized embeddings and the epoch losses.
+            Epoch losses are of shape losses[epoch][batch][step].
+        """
         if isinstance(messages, str):
             messages = [messages]
         if isinstance(target, str):
@@ -400,7 +411,7 @@ class SoftPrompt:
                 batch_losses.append(losses)
             epoch_losses.append(batch_losses)
 
-        return optim_embeds.detach().cpu()
+        return optim_embeds.detach().cpu(), epoch_losses
 
 
 def train_softprompt(
@@ -409,8 +420,9 @@ def train_softprompt(
     messages: str | list[str],
     target: str | list[str],
     config: SoftPromptConfig | None = None,
-) -> Float[Tensor, "optim_seq_len d_model"]:
+) -> tuple[Float[Tensor, "optim_seq_len d_model"], list[list[list[float]]]]:
     """Generates a single optimized string using soft-prompt optimization.
+    By default, trains a universal softprompt for all messages and targets.
 
     Args:
         model: The model to optimize on.
@@ -420,7 +432,8 @@ def train_softprompt(
         config: The configuration to use.
 
     Returns:
-        A SoftPrompt object that contains the optimized strings.
+        A tuple of the optimized embeddings and the epoch losses.
+        Epoch losses are of shape losses[epoch][batch][step].
     """
     if config is None:
         config = SoftPromptConfig()
@@ -428,4 +441,5 @@ def train_softprompt(
     logger.setLevel(logging.INFO if config.verbose else logging.WARNING)
 
     softprompt = SoftPrompt(model, tokenizer, config)
-    return softprompt.run(messages, target)
+    optim_embeds, epoch_losses = softprompt.run(messages, target)
+    return optim_embeds, epoch_losses
