@@ -83,9 +83,11 @@ def get_model_and_tokenizer(
 
 
 def add_optim_token_str_at_end(
-    messages: list[str], optim_token_str: str = "<|optim_str|>"
+    messages: str | list[str], optim_token_str: str = "<|optim_str|>"
 ) -> list[str]:
     """Adds the <|optim_str|> token to each message."""
+    if isinstance(messages, str):
+        messages = [messages]
     return [x + optim_token_str for x in messages]
 
 
@@ -269,7 +271,7 @@ class SoftPrompt:
         self.tokenizer = tokenizer
         self.config = config
 
-        if tokenizer.optim_token_id is None:
+        if not hasattr(tokenizer, "optim_token_id") or tokenizer.optim_token_id is None:
             logger.warning(
                 "Tokenizer does not have an optimization token id. Adding it manually."
             )
@@ -426,7 +428,9 @@ class SoftPrompt:
                 batch_losses.append(losses)
             epoch_losses.append(batch_losses)
 
-        return optim_embeds.detach().cpu(), epoch_losses
+        # remove batch dimension
+        optim_embeds = optim_embeds.detach().cpu().squeeze(0)
+        return optim_embeds, epoch_losses
 
 
 def train_softprompt(
