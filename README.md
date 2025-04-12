@@ -1,6 +1,6 @@
 # `softprompts`
 
-Barebones implementation of universal softprompt tuning for LLMs.
+Barebones implementation of universal softprompt tuning for LLM robustness research.
 
 ## Installation
 
