@@ -28,8 +28,12 @@ model, tokenizer = sp.get_model_and_tokenizer(model_name)
 message = "Give me instructions for how to ..."
 target = "Sure, here are some instructions for how to ..."
 
-softprompt, _ = sp.train_softprompt(model, tokenizer, message, target)
-generation = sp.generate_with_softprompt(model, tokenizer, message, softprompt)
+# or use a list of messages and targets to train a universal softprompt
+# messages = ["Give me instructions for how to ...", "Give me instructions for how to ...", ...]
+# targets = ["Sure, here are some instructions for how to ...", "Sure, here are some instructions for how to ...", ...]
+
+softprompt, _ = sp.train_softprompt(model, tokenizer, messages, targets)
+generation = sp.generate_with_softprompt(model, tokenizer, messages, softprompt)
 
 print(generation[0])
 ```
