@@ -21,7 +21,7 @@ uv add git+https://github.com/serteal/softprompts
 ```python
 import softprompts as sp
 
-model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+model_name = "meta-llama/Llama-3.1-8B-Instruct"
 model, tokenizer = sp.get_model_and_tokenizer(model_name)
 
 # fill in your own message and target

@@ -26,7 +26,7 @@ class SoftPromptConfig:
     num_epochs: int = 1
     batch_size: int = 4
     optim_str_init: str = "x x x x x x x x x x x x x x x x x x x x"
-    lr: float = 0.0001
+    lr: float = 1e-4
     seed: int | None = None
     verbose: bool = True
 
@@ -171,6 +171,7 @@ def generate_with_softprompt(
     messages: str | list[str],
     optim_embeds: Tensor,
     optim_token_str: str = "<|optim_str|>",
+    batch_size: int = 8,
     **generation_kwargs,
 ) -> str | list[str]:
     """Wrapper around model.generate that injects the softprompt at the end of the message.
@@ -196,55 +197,65 @@ def generate_with_softprompt(
     if model.device == torch.device("cpu"):
         logger.warning("Running on CPU -- this will be slow!")
 
-    # Add optimization token, pad & tokenize, and split the messages
-    messages = add_optim_token_str_at_end(messages, optim_token_str)
-    input_ids, attn_mask = tokenize(
-        tokenizer,
-        messages,
-        add_chat_template=True,
-        padding="longest",
-        padding_side="left",
+    dataloader = torch.utils.data.DataLoader(
+        messages, batch_size=batch_size, shuffle=False
     )
-    left_input_ids, right_input_ids, left_attn_mask, right_attn_mask = (
-        split_tokenized_messages_on_optim_str(
-            input_ids, attn_mask, tokenizer.optim_token_id
+
+    generations_list = []
+    for batched_messages in tqdm(dataloader, desc="Generating", total=len(dataloader)):
+        # Add optimization token, pad & tokenize, and split the messages
+        batched_messages = add_optim_token_str_at_end(batched_messages, optim_token_str)
+        input_ids, attn_mask = tokenize(
+            tokenizer,
+            batched_messages,
+            add_chat_template=True,
+            padding="longest",
+            padding_side="left",
         )
-    )
+        input_ids = input_ids.to(model.device)
+        attn_mask = attn_mask.to(model.device)
+        left_input_ids, right_input_ids, left_attn_mask, right_attn_mask = (
+            split_tokenized_messages_on_optim_str(
+                input_ids, attn_mask, tokenizer.optim_token_id
+            )
+        )
 
-    before_embeds, after_embeds = [
-        model.get_input_embeddings()(ids) for ids in (left_input_ids, right_input_ids)
-    ]
+        before_embeds, after_embeds = [
+            model.get_input_embeddings()(ids)
+            for ids in (left_input_ids, right_input_ids)
+        ]
 
-    batched_optim_embeds = optim_embeds.expand(len(messages), -1, -1)
-    batched_attn_mask = torch.ones(
-        len(messages), optim_embeds.shape[1], device=model.device
-    )
+        optim_embeds = optim_embeds.to(model.device)
+        batched_optim_embeds = optim_embeds.expand(len(batched_messages), -1, -1)
+        batched_attn_mask = torch.ones(
+            len(batched_messages), optim_embeds.shape[1], device=model.device
+        )
 
-    input_embeds = torch.cat(
-        [
-            before_embeds.detach(),
-            batched_optim_embeds,
-            after_embeds.detach(),
-        ],
-        dim=1,
-    )
-    input_attn_mask = torch.cat(
-        [
-            left_attn_mask.detach(),
-            batched_attn_mask,
-            right_attn_mask.detach(),
-        ],
-        dim=1,
-    )
+        input_embeds = torch.cat(
+            [
+                before_embeds.detach(),
+                batched_optim_embeds,
+                after_embeds.detach(),
+            ],
+            dim=1,
+        )
+        input_attn_mask = torch.cat(
+            [
+                left_attn_mask.detach(),
+                batched_attn_mask,
+                right_attn_mask.detach(),
+            ],
+            dim=1,
+        )
 
-    logger.info(f"Generating model response with {input_embeds.shape[1]} tokens")
-    generation = model.generate(
-        inputs_embeds=input_embeds,
-        attention_mask=input_attn_mask,
-        **generation_kwargs,
-    )
+        generation = model.generate(
+            inputs_embeds=input_embeds,
+            attention_mask=input_attn_mask,
+            **generation_kwargs,
+        )
+        generations_list.extend(generation)
 
-    return tokenizer.batch_decode(generation, skip_special_tokens=True)
+    return tokenizer.batch_decode(generations_list, skip_special_tokens=False)
 
 
 class SoftPrompt:
@@ -303,6 +314,7 @@ class SoftPrompt:
         optim_ids, _ = tokenize(
             self.tokenizer, self.config.optim_str_init, add_special_tokens=False
         )
+        optim_ids = optim_ids.to(self.device)
         optim_embeds = (
             self.model.get_input_embeddings()(optim_ids)
             .detach()
@@ -336,6 +348,8 @@ class SoftPrompt:
                     padding="longest",
                     padding_side="left",
                 )
+                input_ids = input_ids.to(self.device)
+                attn_mask = attn_mask.to(self.device)
                 left_input_ids, right_input_ids, left_attn_mask, right_attn_mask = (
                     split_tokenized_messages_on_optim_str(
                         input_ids, attn_mask, self.tokenizer.optim_token_id
@@ -349,7 +363,8 @@ class SoftPrompt:
                     padding_side="right",
                     add_special_tokens=False,
                 )
-
+                target_ids = target_ids.to(self.device)
+                target_attn_mask = target_attn_mask.to(self.device)
                 # Embeds everything that doesn't get optimized
                 before_embeds, after_embeds, target_embeds = [
                     self.model.get_input_embeddings()(ids)
